@@ -80,18 +80,19 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
 
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
-        # Self Attention
-        hidden_states = self.self_attn(
+        # Self Attention - EAGLE3 must use native path, not NPU optimized kernel
+        # because qkv_proj input is 2*hidden_size which is incompatible with split_qkv_rmsnorm_rope
+        q, k, v = self.self_attn.forward_prepare_native(
             positions=positions,
             hidden_states=hidden_states,
-            forward_batch=forward_batch,
         )
+        attn_output = self.self_attn.attn(q, k, v, forward_batch)
+        hidden_states, _ = self.self_attn.o_proj(attn_output)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
@@ -159,7 +160,7 @@ class LlamaModel(nn.Module):
             positions = forward_batch.mrope_positions
 
         # Standalone mode: generate hidden_states from embeds if spec_info not available
-        if hasattr(forward_batch, 'spec_info') and forward_batch.spec_info is not None:
+        if hasattr(forward_batch, "spec_info") and forward_batch.spec_info is not None:
             hidden_states = forward_batch.spec_info.hidden_states
             if hidden_states.shape[-1] != embeds.shape[-1]:
                 hidden_states = self.fc(hidden_states)
