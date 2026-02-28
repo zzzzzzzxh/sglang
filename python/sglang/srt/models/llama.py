@@ -96,8 +96,7 @@ class LlamaMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -425,7 +424,7 @@ class LlamaModel(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -520,6 +519,14 @@ class LlamaForCausalLM(nn.Module):
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
+        else:
+            # Defensive: If hidden_states is a tuple but capture_aux_hidden_states is False,
+            # it means the model always returns a tuple (like EAGLE3 draft models)
+            # Try to unpack it anyway
+            if isinstance(hidden_states, tuple) and len(hidden_states) == 2:
+                if isinstance(hidden_states[1], list):
+                    # Standard EAGLE3 format: (tensor, [aux_tensor])
+                    hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
