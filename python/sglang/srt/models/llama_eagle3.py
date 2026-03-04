@@ -20,6 +20,7 @@ from sglang.srt.utils import add_prefix
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
 
 import copy
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -80,7 +81,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
@@ -142,6 +142,66 @@ class LlamaModel(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # For tensor saving
+        self.save_tensors = os.environ.get("SGLANG_SAVE_TENSORS", "0") == "1"
+        self.save_dir = os.environ.get("SGLANG_SAVE_DIR", "/tmp/sglang_tensors")
+        self.forward_count = 0
+
+    def _save_input_tensors(
+        self, input_ids, positions, forward_batch, embeds, hidden_states_before_fc
+    ):
+        """Save input tensors for comparison"""
+        inputs_dir = os.path.join(
+            self.save_dir, f"forward_{self.forward_count}", "inputs"
+        )
+        os.makedirs(inputs_dir, exist_ok=True)
+
+        # Save input_ids
+        if input_ids is not None:
+            torch.save(input_ids.cpu(), os.path.join(inputs_dir, "input_ids.pt"))
+            print(
+                f"[SGLANG] Saved input_ids: shape={input_ids.shape}, dtype={input_ids.dtype}"
+            )
+
+        # Save positions
+        if positions is not None:
+            torch.save(positions.cpu(), os.path.join(inputs_dir, "positions.pt"))
+            print(
+                f"[SGLANG] Saved positions: shape={positions.shape}, dtype={positions.dtype}"
+            )
+
+        # Save embeds (after embedding lookup)
+        if embeds is not None:
+            torch.save(embeds.cpu(), os.path.join(inputs_dir, "embeds.pt"))
+            print(f"[SGLANG] Saved embeds: shape={embeds.shape}, dtype={embeds.dtype}")
+
+        # Save hidden_states from spec_info (before fc projection)
+        if hidden_states_before_fc is not None:
+            torch.save(
+                hidden_states_before_fc.cpu(),
+                os.path.join(inputs_dir, "hidden_states_before_fc.pt"),
+            )
+            print(
+                f"[SGLANG] Saved hidden_states_before_fc: shape={hidden_states_before_fc.shape}, dtype={hidden_states_before_fc.dtype}"
+            )
+
+        # Save forward_batch info
+        if forward_batch is not None:
+            batch_info = {}
+            if (
+                hasattr(forward_batch, "seq_lens")
+                and forward_batch.seq_lens is not None
+            ):
+                batch_info["seq_lens"] = forward_batch.seq_lens.cpu()
+            if (
+                hasattr(forward_batch, "block_tables")
+                and forward_batch.block_tables is not None
+            ):
+                batch_info["block_tables"] = forward_batch.block_tables.cpu()
+
+            torch.save(batch_info, os.path.join(inputs_dir, "forward_batch_info.pt"))
+            print(f"[SGLANG] Saved forward_batch info")
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -159,8 +219,30 @@ class LlamaModel(nn.Module):
             positions = forward_batch.mrope_positions
 
         hidden_states = forward_batch.spec_info.hidden_states
-        if hidden_states.shape[-1] != embeds.shape[-1]:
-            hidden_states = self.fc(hidden_states)
+
+        # Save input tensors before any computation (only first forward pass)
+        if self.save_tensors and self.forward_count == 0:
+            hidden_states_before_fc = hidden_states
+            if hidden_states.shape[-1] != embeds.shape[-1]:
+                hidden_states = self.fc(hidden_states)
+            self._save_input_tensors(
+                input_ids, positions, forward_batch, embeds, hidden_states_before_fc
+            )
+
+            # Save hidden_states after fc projection
+            inputs_dir = os.path.join(
+                self.save_dir, f"forward_{self.forward_count}", "inputs"
+            )
+            torch.save(
+                hidden_states.cpu(),
+                os.path.join(inputs_dir, "hidden_states_after_fc.pt"),
+            )
+            print(
+                f"[SGLANG] Saved hidden_states_after_fc: shape={hidden_states.shape}, dtype={hidden_states.dtype}"
+            )
+        else:
+            if hidden_states.shape[-1] != embeds.shape[-1]:
+                hidden_states = self.fc(hidden_states)
 
         # idle batch
         if hidden_states.shape[0] == 0:
@@ -178,6 +260,37 @@ class LlamaModel(nn.Module):
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
             hidden_states, residual
         )
+
+        # Save output tensors (only first forward pass)
+        if self.save_tensors and self.forward_count == 0:
+            outputs_dir = os.path.join(
+                self.save_dir, f"forward_{self.forward_count}", "outputs"
+            )
+            os.makedirs(outputs_dir, exist_ok=True)
+
+            torch.save(
+                hidden_states_to_logits.cpu(),
+                os.path.join(outputs_dir, "hidden_states_to_logits.pt"),
+            )
+            print(
+                f"[SGLANG] Saved hidden_states_to_logits: shape={hidden_states_to_logits.shape}, dtype={hidden_states_to_logits.dtype}"
+            )
+
+            if isinstance(hidden_states_to_aux, list):
+                aux_to_save = torch.cat(hidden_states_to_aux, dim=-1)
+            else:
+                aux_to_save = hidden_states_to_aux
+            torch.save(
+                aux_to_save.cpu(), os.path.join(outputs_dir, "aux_hidden_states.pt")
+            )
+            print(
+                f"[SGLANG] Saved aux_hidden_states: shape={aux_to_save.shape}, dtype={aux_to_save.dtype}"
+            )
+
+            self.forward_count += 1
+            print(
+                f"[SGLANG] Completed tensor saving for forward pass {self.forward_count}"
+            )
 
         # For draft decode, we capture the hidden state before norm
         return hidden_states_to_logits, [hidden_states_to_aux]
@@ -226,6 +339,11 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
 
+        # For tensor saving/comparison experiment
+        self.save_tensors = os.environ.get("SGLANG_SAVE_TENSORS", "0") == "1"
+        self.save_dir = os.environ.get("SGLANG_SAVE_DIR", "/tmp/sglang_tensors")
+        self.forward_count = 0
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         # Define the parameter mapping for stacked parameters
@@ -268,6 +386,115 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+        # Save model weights if enabled
+        if self.save_tensors:
+            self._save_model_weights()
+
+    def _save_model_weights(self):
+        """Save all model weights to disk for comparison"""
+        os.makedirs(self.save_dir, exist_ok=True)
+        weights_dir = os.path.join(self.save_dir, "weights")
+        os.makedirs(weights_dir, exist_ok=True)
+
+        # Save all model parameters
+        for name, param in self.named_parameters():
+            if param is not None:
+                save_path = os.path.join(weights_dir, f"{name.replace('.', '_')}.pt")
+                torch.save(param.data.cpu(), save_path)
+                print(f"[SGLANG] Saved weight: {name} -> {save_path}")
+
+        # Save config
+        config_path = os.path.join(self.save_dir, "config.pt")
+        torch.save(
+            {
+                "vocab_size": self.config.vocab_size,
+                "hidden_size": self.config.hidden_size,
+                "num_hidden_layers": self.config.num_hidden_layers,
+                "draft_vocab_size": getattr(self.config, "draft_vocab_size", None),
+            },
+            config_path,
+        )
+        print(f"[SGLANG] Saved config to {config_path}")
+
+    def _save_input_tensors(self, input_ids, positions, forward_batch):
+        """Save input tensors for a single forward pass"""
+        inputs_dir = os.path.join(
+            self.save_dir, f"forward_{self.forward_count}", "inputs"
+        )
+        os.makedirs(inputs_dir, exist_ok=True)
+
+        # Save input_ids
+        if input_ids is not None:
+            torch.save(input_ids.cpu(), os.path.join(inputs_dir, "input_ids.pt"))
+            print(f"[SGLANG] Saved input_ids: shape={input_ids.shape}")
+
+        # Save positions
+        if positions is not None:
+            torch.save(positions.cpu(), os.path.join(inputs_dir, "positions.pt"))
+            print(f"[SGLANG] Saved positions: shape={positions.shape}")
+
+        # Save hidden_states from spec_info
+        if (
+            forward_batch is not None
+            and hasattr(forward_batch, "spec_info")
+            and forward_batch.spec_info is not None
+        ):
+            hidden_states = forward_batch.spec_info.hidden_states
+            if hidden_states is not None:
+                torch.save(
+                    hidden_states.cpu(), os.path.join(inputs_dir, "hidden_states.pt")
+                )
+                print(f"[SGLANG] Saved hidden_states: shape={hidden_states.shape}")
+
+        # Save other forward_batch info
+        if forward_batch is not None:
+            batch_info = {}
+            if hasattr(forward_batch, "seq_lens"):
+                batch_info["seq_lens"] = (
+                    forward_batch.seq_lens.cpu()
+                    if forward_batch.seq_lens is not None
+                    else None
+                )
+            if hasattr(forward_batch, "block_tables"):
+                batch_info["block_tables"] = (
+                    forward_batch.block_tables.cpu()
+                    if forward_batch.block_tables is not None
+                    else None
+                )
+            if hasattr(forward_batch, "positions"):
+                batch_info["positions"] = (
+                    forward_batch.positions.cpu()
+                    if forward_batch.positions is not None
+                    else None
+                )
+
+            torch.save(batch_info, os.path.join(inputs_dir, "forward_batch_info.pt"))
+            print(f"[SGLANG] Saved forward_batch info")
+
+    def _save_output_tensors(self, hidden_states, aux_hidden_states):
+        """Save output tensors from forward pass"""
+        outputs_dir = os.path.join(
+            self.save_dir, f"forward_{self.forward_count}", "outputs"
+        )
+        os.makedirs(outputs_dir, exist_ok=True)
+
+        # Save hidden_states (logits input)
+        if hidden_states is not None:
+            torch.save(
+                hidden_states.cpu(), os.path.join(outputs_dir, "hidden_states.pt")
+            )
+            print(f"[SGLANG] Saved output hidden_states: shape={hidden_states.shape}")
+
+        # Save aux_hidden_states
+        if aux_hidden_states is not None:
+            if isinstance(aux_hidden_states, list):
+                aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+            torch.save(
+                aux_hidden_states.cpu(),
+                os.path.join(outputs_dir, "aux_hidden_states.pt"),
+            )
+            print(f"[SGLANG] Saved aux_hidden_states: shape={aux_hidden_states.shape}")
 
     def get_hot_token_id(self):
         return self.hot_token_id
