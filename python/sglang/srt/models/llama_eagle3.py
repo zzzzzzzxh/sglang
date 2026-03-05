@@ -147,6 +147,58 @@ class LlamaModel(nn.Module):
         self.save_dir = os.environ.get("SGLANG_SAVE_DIR", "/tmp/sglang_tensors")
         self.forward_count = 0
 
+        # For tensor loading (use saved tensors as fixed input)
+        self.load_tensors = os.environ.get("SGLANG_LOAD_TENSORS", "0") == "1"
+        self.load_dir = os.environ.get("SGLANG_LOAD_DIR", "/tmp/sglang_tensors")
+        self.loaded_tensors = {}
+
+        if self.load_tensors:
+            self._load_tensors_from_saved()
+
+    def _load_tensors_from_saved(self):
+        """Load previously saved tensors to use as fixed input"""
+        forward_dir = os.path.join(self.load_dir, "forward_0")
+        inputs_dir = os.path.join(forward_dir, "inputs")
+
+        if not os.path.exists(inputs_dir):
+            print(f"[SGLANG] Warning: No saved tensors found at {inputs_dir}")
+            return
+
+        # Load all input tensors
+        tensor_files = {
+            "input_ids": "input_ids.pt",
+            "positions": "positions.pt",
+            "embeds": "embeds.pt",
+            "hidden_states_before_fc": "hidden_states_before_fc.pt",
+            "hidden_states_after_fc": "hidden_states_after_fc.pt",
+        }
+
+        for key, filename in tensor_files.items():
+            filepath = os.path.join(inputs_dir, filename)
+            if os.path.exists(filepath):
+                tensor = torch.load(filepath, map_location="cpu", weights_only=True)
+                self.loaded_tensors[key] = tensor
+                print(
+                    f"[SGLANG] Loaded {key}: shape={tensor.shape}, dtype={tensor.dtype}"
+                )
+            else:
+                print(f"[SGLANG] Warning: {filename} not found, skipping")
+
+        # Load forward_batch_info separately (it's a dict)
+        batch_info_path = os.path.join(inputs_dir, "forward_batch_info.pt")
+        if os.path.exists(batch_info_path):
+            batch_info = torch.load(
+                batch_info_path, map_location="cpu", weights_only=False
+            )
+            self.loaded_tensors["forward_batch_info"] = batch_info
+            print(
+                f"[SGLANG] Loaded forward_batch_info: keys={list(batch_info.keys()) if isinstance(batch_info, dict) else 'not a dict'}"
+            )
+
+        print(
+            f"[SGLANG] Total loaded {len(self.loaded_tensors)} tensors for fixed input"
+        )
+
     def _save_input_tensors(
         self, input_ids, positions, forward_batch, embeds, hidden_states_before_fc
     ):
@@ -210,15 +262,57 @@ class LlamaModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # Load fixed tensors if enabled (only first forward pass)
+        if (
+            self.load_tensors
+            and len(self.loaded_tensors) > 0
+            and self.forward_count == 0
+        ):
+            print(
+                f"[SGLANG] Using loaded tensors as fixed input (forward {self.forward_count})"
+            )
+
+            # Override input_ids
+            if "input_ids" in self.loaded_tensors:
+                input_ids = self.loaded_tensors["input_ids"].to(input_ids.device)
+                print(f"[SGLANG] Overriding input_ids: shape={input_ids.shape}")
+
+            # Override positions
+            if "positions" in self.loaded_tensors:
+                positions = self.loaded_tensors["positions"].to(positions.device)
+                print(f"[SGLANG] Overriding positions: shape={positions.shape}")
+
         if input_embeds is None:
             embeds = self.embed_tokens(input_ids)
         else:
             embeds = input_embeds
 
+        # Override embeds if loaded
+        if (
+            self.load_tensors
+            and "embeds" in self.loaded_tensors
+            and self.forward_count == 0
+        ):
+            embeds = self.loaded_tensors["embeds"].to(embeds.device)
+            print(f"[SGLANG] Overriding embeds: shape={embeds.shape}")
+
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
         hidden_states = forward_batch.spec_info.hidden_states
+
+        # Override hidden_states before fc if loaded
+        if (
+            self.load_tensors
+            and "hidden_states_before_fc" in self.loaded_tensors
+            and self.forward_count == 0
+        ):
+            hidden_states = self.loaded_tensors["hidden_states_before_fc"].to(
+                hidden_states.device
+            )
+            print(
+                f"[SGLANG] Overriding hidden_states_before_fc: shape={hidden_states.shape}"
+            )
 
         # Save input tensors before any computation (only first forward pass)
         if self.save_tensors and self.forward_count == 0:
@@ -243,6 +337,19 @@ class LlamaModel(nn.Module):
         else:
             if hidden_states.shape[-1] != embeds.shape[-1]:
                 hidden_states = self.fc(hidden_states)
+
+        # Override hidden_states after fc if loaded
+        if (
+            self.load_tensors
+            and "hidden_states_after_fc" in self.loaded_tensors
+            and self.forward_count == 0
+        ):
+            hidden_states = self.loaded_tensors["hidden_states_after_fc"].to(
+                hidden_states.device
+            )
+            print(
+                f"[SGLANG] Overriding hidden_states_after_fc: shape={hidden_states.shape}"
+            )
 
         # idle batch
         if hidden_states.shape[0] == 0:
@@ -290,6 +397,17 @@ class LlamaModel(nn.Module):
             self.forward_count += 1
             print(
                 f"[SGLANG] Completed tensor saving for forward pass {self.forward_count}"
+            )
+
+        # Increment forward count for load mode (only first forward pass)
+        if (
+            self.load_tensors
+            and len(self.loaded_tensors) > 0
+            and self.forward_count == 0
+        ):
+            self.forward_count += 1
+            print(
+                f"[SGLANG] Completed tensor loading for forward pass {self.forward_count}"
             )
 
         # For draft decode, we capture the hidden state before norm
